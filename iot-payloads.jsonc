@@ -1,0 +1,22 @@
+# Panic event topic: labguard/labs/LAB01/events
+{
+  "schemaVersion": "1.0",
+  "eventId": "unique-device-event-id",
+  "deviceId": "ESP32-LAB01-001",
+  "labId": "LAB01",
+  "eventType": "PANIC_BUTTON_PRESSED",
+  "occurredAt": "2026-10-09T06:15:00Z",
+  "severity": "Critical",
+  "firmwareVersion": "1.0.0"
+}
+
+# Heartbeat topic: labguard/labs/LAB01/heartbeat
+{
+  "schemaVersion": "1.0",
+  "eventId": "heartbeat-unique-id",
+  "deviceId": "ESP32-LAB01-001",
+  "labId": "LAB01",
+  "eventType": "HEARTBEAT",
+  "occurredAt": "2026-10-09T06:15:00Z",
+  "firmwareVersion": "1.0.0"
+}

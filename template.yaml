@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: LabGuard serverless backend for college laboratory incident response.
+
+Parameters:
+  DashboardOrigin:
+    Type: String
+    Default: http://localhost:5500
+    Description: Exact browser origin used by the dashboard. Use HTTPS for deployed sites.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional IT administrator email; confirm the SNS subscription after deployment.
+  CognitoUserPoolDomainPrefix:
+    Type: String
+    Default: labguard-student-change-this
+    Description: Globally unique Cognito hosted UI domain prefix. Change before deployment.
+  AllowedDeviceMap:
+    Type: String
+    Default: '{"ESP32-LAB01-001":"LAB01"}'
+    Description: JSON mapping of allowed device IDs to lab IDs. Edit to match your device.
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 15
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        NOTIFICATIONS_TABLE: !Ref NotificationsTable
+        HEARTBEATS_TABLE: !Ref HeartbeatsTable
+        DEDUP_TABLE: !Ref DedupTable
+        ARCHIVE_BUCKET: !Ref IncidentArchiveBucket
+        SNS_TOPIC_ARN: !Ref IncidentAlertsTopic
+        ALLOWED_DEVICE_MAP: !Ref AllowedDeviceMap
+
+Resources:
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: incidentId, AttributeType: S }
+        - { AttributeName: entityType, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: incidentId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ByEntityAndCreatedAt
+          KeySchema:
+            - { AttributeName: entityType, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: notificationId, AttributeType: S }
+        - { AttributeName: entityType, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: notificationId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: ByEntityAndCreatedAt
+          KeySchema:
+            - { AttributeName: entityType, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  HeartbeatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: deviceId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: deviceId, KeyType: HASH }
+
+  DedupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: eventId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: eventId, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  IncidentArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+
+  IncidentAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: LabGuard IT administrator incident alerts
+
+  AdminEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref IncidentAlertsTopic
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: LabGuardUsers
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      MfaConfiguration: OPTIONAL
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: LabGuardDashboard
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: [!Ref DashboardOrigin]
+      LogoutURLs: [!Ref DashboardOrigin]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoUserPoolDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  LabAssistantGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: LabAssistant
+      UserPoolId: !Ref UserPool
+      Description: Can list, read, and create incidents.
+
+  ITAdministratorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ITAdministrator
+      UserPoolId: !Ref UserPool
+      Description: Can list, read, create, and update incidents.
+
+  LabGuardHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins: [!Ref DashboardOrigin]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PATCH, OPTIONS]
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+        DefaultAuthorizer: CognitoJwtAuthorizer
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: api.handler
+      Environment:
+        Variables:
+          INCIDENTS_TABLE: !Ref IncidentsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          HEARTBEATS_TABLE: !Ref HeartbeatsTable
+          DEDUP_TABLE: !Ref DedupTable
+          ARCHIVE_BUCKET: !Ref IncidentArchiveBucket
+          SNS_TOPIC_ARN: !Ref IncidentAlertsTopic
+          ALLOWED_DEVICE_MAP: !Ref AllowedDeviceMap
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref HeartbeatsTable }
+        - S3WritePolicy: { BucketName: !Ref IncidentArchiveBucket }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt IncidentAlertsTopic.TopicName }
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LabGuardHttpApi
+            Path: /health
+            Method: GET
+            Auth: { Authorizer: NONE }
+        ListIncidents:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: /incidents, Method: GET }
+        GetIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: '/incidents/{incidentId}', Method: GET }
+        CreateIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: /incidents, Method: POST }
+        UpdateIncident:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: '/incidents/{incidentId}', Method: PATCH }
+        LabStatus:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: /lab/status, Method: GET }
+        Notifications:
+          Type: HttpApi
+          Properties: { ApiId: !Ref LabGuardHttpApi, Path: /notifications, Method: GET }
+
+  IoTIngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: iot_handler.handler
+      Timeout: 20
+      Environment:
+        Variables:
+          INCIDENTS_TABLE: !Ref IncidentsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          HEARTBEATS_TABLE: !Ref HeartbeatsTable
+          DEDUP_TABLE: !Ref DedupTable
+          ARCHIVE_BUCKET: !Ref IncidentArchiveBucket
+          SNS_TOPIC_ARN: !Ref IncidentAlertsTopic
+          ALLOWED_DEVICE_MAP: !Ref AllowedDeviceMap
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref NotificationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref HeartbeatsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref DedupTable }
+        - S3WritePolicy: { BucketName: !Ref IncidentArchiveBucket }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt IncidentAlertsTopic.TopicName }
+
+  EmergencyIoTInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IoTIngestionFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:rule/LabGuardEmergencyEvents'
+
+  HeartbeatIoTInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IoTIngestionFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:rule/LabGuardHeartbeatEvents'
+
+  EmergencyIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: LabGuardEmergencyEvents
+      TopicRulePayload:
+        Sql: "SELECT *, topic() as mqttTopic FROM 'labguard/labs/+/events'"
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - Lambda: { FunctionArn: !GetAtt IoTIngestionFunction.Arn }
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTErrorLogGroup
+            RoleArn: !GetAtt IoTRuleLogRole.Arn
+
+  HeartbeatIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: LabGuardHeartbeatEvents
+      TopicRulePayload:
+        Sql: "SELECT *, topic() as mqttTopic FROM 'labguard/labs/+/heartbeat'"
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - Lambda: { FunctionArn: !GetAtt IoTIngestionFunction.Arn }
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTErrorLogGroup
+            RoleArn: !GetAtt IoTRuleLogRole.Arn
+
+  IoTRuleLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: iot.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteIoTRuleErrors
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${IoTErrorLogGroup.Arn}:*"
+
+  IoTErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/iot/labguard
+      RetentionInDays: 30
+
+Outputs:
+  ApiBaseUrl:
+    Description: API Gateway HTTPS base URL
+    Value: !Sub "https://${LabGuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoHostedUiUrl:
+    Value: !Sub "https://${CognitoUserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  IncidentAlertsTopicArn:
+    Value: !Ref IncidentAlertsTopic
+  IncidentArchiveBucketName:
+    Value: !Ref IncidentArchiveBucket
+  IoTIngestionLambdaArn:
+    Value: !GetAtt IoTIngestionFunction.Arn
